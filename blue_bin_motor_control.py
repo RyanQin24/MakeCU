@@ -39,6 +39,8 @@ import logging
 import argparse
 import time
 import serial
+import cv2
+import numpy as np
 from blue_bin_detector import BlueBinDetector
 from triple_ultrasonic_sensor import TripleUltrasonicSensor
 
@@ -80,7 +82,15 @@ STOP_MIN_CONFIDENCE = 0.3         # minimum confidence for stopping
 SERVO_EXTEND_COMMAND = 'e'
 SERVO_RETRACT_COMMAND = 'r'
 SERVO_CYCLE_COUNT = 3             # Number of extend/retract cycles
-SERVO_ACTION_DELAY = 2.0          # Seconds to wait for servo to complete action
+SERVO_ACTION_DELAY = 1.0          # Seconds to wait for servo to complete action
+
+# ArUco marker detection
+ARUCO_TARGET_ID = 22              # Looking for ArUco marker ID 22
+ARUCO_FULL_FRAME_THRESHOLD = 0.70 # 70% of frame = reached ArUco (lower than blue bin since it's hanging higher)
+ARUCO_CENTER_TOLERANCE = 50       # pixels - ArUco centering tolerance
+ARUCO_MIN_AREA = 1000             # minimum marker area to consider valid
+RETURN_BACKUP_DURATION = 2.0      # Seconds to backup after servo cycles
+TURN_360_DURATION = 2         # Seconds for full 360° turn (adjust based on testing)
 
 
 def send_motor_command(ser, left_power, right_power):
@@ -215,6 +225,122 @@ def perform_servo_cycles(motor_ser, servo_ser):
     
     logging.info("✓ Servo cycles complete")
     logging.info("🎉 FINISHED - Mission complete!")
+
+
+def return_to_start_and_find_aruco(motor_ser, sensors):
+    """
+    After servo cycles: backup, do 360° turn to find ArUco start position.
+    
+    Args:
+        motor_ser: Motor serial connection
+        sensors: TripleUltrasonicSensor instance (for obstacle avoidance during backup)
+    """
+    logging.info("🔙 Starting return sequence")
+    
+    # Step 1: Backup for 2 seconds
+    logging.info("  → Backing up...")
+    send_motor_command(motor_ser, -200, 200)
+    time.sleep(RETURN_BACKUP_DURATION)
+    stop_motors(motor_ser)
+    
+    # Step 2: Do 360° turn in place to find ArUco starting position
+    logging.info("  ↻ Performing 360° turn...")
+    # Turn in place: one motor forward, one backward at half power
+    turn_power = LEFT_L_POWER
+    send_motor_command(motor_ser, -turn_power, -turn_power)  # Turn right in place
+    time.sleep(TURN_360_DURATION)
+    stop_motors(motor_ser)
+    
+    logging.info("✓ Return sequence complete - ready for ArUco detection")
+
+
+def detect_aruco_marker(cap, aruco_dict, parameters, target_id=ARUCO_TARGET_ID):
+    """
+    Detect ArUco marker in current camera frame.
+    
+    Args:
+        cap: OpenCV VideoCapture object
+        aruco_dict: ArUco dictionary
+        parameters: ArUco detection parameters
+        target_id: Target marker ID to look for
+        
+    Returns:
+        Tuple of (cx, cy, area, marker_id) or None if target not found
+    """
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        return None
+    
+    # Convert to grayscale
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Detect markers
+    corners, ids, rejected = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+    
+    if corners is None or len(corners) == 0 or ids is None:
+        return None
+    
+    # Look for target ID
+    for i, marker_id in enumerate(ids.flatten()):
+        if marker_id == target_id:
+            # Found target marker - calculate center and area
+            first = np.array(corners[i])
+            pts = first.reshape((-1, 2))
+            center = pts.mean(axis=0)
+            cx, cy = center
+            area = cv2.contourArea(pts)
+            
+            return (cx, cy, area, marker_id)
+    
+    return None
+
+
+def compute_aruco_motor_command(cx, frame_width, marker_area):
+    """
+    Compute motor commands to approach and center on ArUco marker.
+    Similar to blue bin tracking but for ArUco.
+    
+    Args:
+        cx: marker center x-coordinate
+        frame_width: width of camera frame
+        marker_area: area of detected marker
+        
+    Returns:
+        tuple: (left_power, right_power, action_description, reached)
+        reached: True if ArUco fills enough of frame (stop condition)
+    """
+    frame_center_x = frame_width / 2.0
+    offset_x = cx - frame_center_x
+    
+    # Calculate area ratio (similar to blue_ratio)
+    # Assuming 640x480 frame
+    frame_area = frame_width * 480  # approximate
+    area_ratio = marker_area / frame_area
+    
+    # Check if ArUco fills enough of frame (reached)
+    if area_ratio >= ARUCO_FULL_FRAME_THRESHOLD and abs(offset_x) <= ARUCO_CENTER_TOLERANCE:
+        return (0, 0, f"🎯 REACHED ARUCO (area={area_ratio*100:.0f}%)", True)
+    
+    # Check if marker is centered
+    if abs(offset_x) <= ARUCO_CENTER_TOLERANCE:
+        # Centered - move forward if marker is large enough
+        if marker_area >= ARUCO_MIN_AREA:
+            return (FORWARD_LEFT_POWER, FORWARD_RIGHT_POWER, "Forward (ArUco centered)", False)
+        else:
+            return (0, 0, "Stop (ArUco too far)", False)
+    
+    # Marker off-center - turn to center it
+    # Use same turn logic as blue bin tracking (which works correctly)
+    if offset_x < 0:
+        # Marker left of center - turn left
+        turn_left = LEFT_L_POWER // TURN_SPEED_DIVISOR
+        turn_right = LEFT_R_POWER // TURN_SPEED_DIVISOR
+        return (-turn_left, -turn_right, "Turn left (ArUco)", False)
+    else:
+        # Marker right of center - turn right
+        turn_left = LEFT_L_POWER // TURN_SPEED_DIVISOR
+        turn_right = LEFT_R_POWER // TURN_SPEED_DIVISOR
+        return (turn_left, turn_right, "Turn right (ArUco)", False)
 
 
 def search_360_for_bin(ser, detector):
@@ -452,13 +578,30 @@ def main():
     no_detection_count = 0
     consecutive_no_detection = 0  # Track consecutive frames without detection
     in_obstacle_avoidance = False  # Flag to pause bin tracking during arc-around
-    mission_complete = False  # Flag to end program after servo cycles
-    no_detection_count = 0
-    consecutive_no_detection = 0  # Track consecutive frames without detection
-    in_obstacle_avoidance = False  # Flag to pause bin tracking during arc-around
+    mission_complete = False  # Flag to end program after all phases
+    in_aruco_mode = False  # Flag to switch to ArUco detection mode
+    
+    # Initialize ArUco detection components
+    if hasattr(cv2.aruco, 'getPredefinedDictionary'):
+        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    elif hasattr(cv2.aruco, 'Dictionary_get'):
+        aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_50)
+    else:
+        raise RuntimeError("Unable to obtain ArUco dictionary")
+    
+    if hasattr(cv2.aruco, 'DetectorParameters_create'):
+        aruco_parameters = cv2.aruco.DetectorParameters_create()
+    elif hasattr(cv2.aruco, 'DetectorParameters'):
+        aruco_parameters = cv2.aruco.DetectorParameters()
+    else:
+        raise RuntimeError("cv2.aruco does not expose DetectorParameters")
+    
+    # Get camera capture from detector for ArUco phase
+    camera_cap = detector.cap  # Reuse camera from BlueBinDetector
     
     try:
-        while True:
+        # ========== PHASE 1: BLUE BIN TRACKING ==========
+        while not in_aruco_mode:
             frame_count += 1
             
             # Read obstacle sensors
@@ -553,9 +696,14 @@ def main():
                             # Perform servo cycles
                             perform_servo_cycles(motor_ser, servo_ser)
                             
-                            # Set flag to end program
-                            mission_complete = True
-                            break  # Exit main loop
+                            # After servo cycles: return to start and find ArUco
+                            return_to_start_and_find_aruco(motor_ser, sensors)
+                            
+                            # Set flag to switch to ArUco detection mode
+                            mission_complete = False  # Continue to ArUco phase
+                            in_aruco_mode = True
+                            logging.info("🔍 Switching to ArUco detection mode")
+                            break  # Exit blue bin loop
                         
                         # Log info periodically or when action changes
                         if action != last_action or frame_count % 30 == 0:
@@ -600,6 +748,78 @@ def main():
 
             # Small delay to prevent overwhelming the system
             time.sleep(0.05)
+        
+        # ========== PHASE 2: ARUCO TRACKING ==========
+        if in_aruco_mode:
+            logging.info("\n" + "="*60)
+            logging.info("PHASE 2: ARUCO MARKER DETECTION")
+            logging.info("="*60)
+            logging.info(f"Looking for ArUco marker ID {ARUCO_TARGET_ID}")
+            
+            last_action = "Searching for ArUco"
+            aruco_frame_count = 0
+            aruco_reached = False
+            
+            while not aruco_reached:
+                aruco_frame_count += 1
+                
+                # Read obstacle sensors
+                obstacles = sensors.read_sensors()
+                
+                # Detect ArUco marker (ID 22)
+                aruco_detection = detect_aruco_marker(camera_cap, aruco_dict, aruco_parameters, ARUCO_TARGET_ID)
+                
+                if aruco_detection is not None:
+                    cx, cy, area, marker_id = aruco_detection
+                    
+                    if args.debug:
+                        logging.debug(f"[ARUCO] ID:{marker_id} Center:({cx:.0f},{cy:.0f}) Area:{area:.0f}")
+                    
+                    # Compute motor command to approach ArUco
+                    left_power, right_power, action, reached = compute_aruco_motor_command(
+                        cx, frame_width, area
+                    )
+                    
+                    # Check if reached ArUco
+                    if reached:
+                        logging.info("="*60)
+                        logging.info(f"🎯 REACHED ARUCO MARKER ID {marker_id}!")
+                        logging.info("="*60)
+                        stop_motors(motor_ser)
+                        aruco_reached = True
+                        mission_complete = True
+                        break
+                    
+                    # Send motor command
+                    send_motor_command(motor_ser, left_power, right_power)
+                    
+                    # Log periodically
+                    if action != last_action or aruco_frame_count % 30 == 0:
+                        logging.info(
+                            f"ArUco ID {marker_id} | Center:({cx:.0f},{cy:.0f}) | Area:{area:.0f} | "
+                            f"Obstacles: F={obstacles['front']:.0f} L={obstacles['left']:.0f} R={obstacles['right']:.0f}cm | "
+                            f"Action: {action}"
+                        )
+                        last_action = action
+                
+                else:
+                    # No ArUco detected - stop and wait
+                    stop_motors(motor_ser)
+                    if last_action != "Searching for ArUco":
+                        logging.info("✗ ArUco marker lost - stopping")
+                        last_action = "Searching for ArUco"
+                    
+                    if aruco_frame_count % 50 == 0:
+                        logging.info(f"Searching for ArUco ID {ARUCO_TARGET_ID}... (frame {aruco_frame_count})")
+                
+                # Small delay
+                time.sleep(0.05)
+            
+            # Mission complete - enter idle state
+            logging.info("\n" + "="*60)
+            logging.info("🏁 ALL PHASES COMPLETE - ENTERING IDLE STATE")
+            logging.info("="*60)
+            stop_motors(motor_ser)
 
 
     except KeyboardInterrupt:
