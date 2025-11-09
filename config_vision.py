@@ -27,11 +27,12 @@ SAFE_DISTANCE = 80.0      # Full speed
 CAMERA_INDEX = 0          # 0 = default camera, 1 = USB camera
 
 # Blue bin color detection (HSV color space)
-BLUE_LOWER_HSV = (90, 100, 100)   # Lower bound for blue
-BLUE_UPPER_HSV = (130, 255, 255)  # Upper bound for blue
+# Values matched to working blue detector code
+BLUE_LOWER_HSV = (90, 80, 40)      # H:90-130, S:80+, V:40+ (matches working code)
+BLUE_UPPER_HSV = (130, 255, 255)   # Upper bound for blue
 
 # Minimum area for valid detection (pixels²)
-MIN_BIN_AREA = 500
+MIN_BIN_AREA = 1500  # Increased to 1500 to match working code and filter noise
 
 # Camera resolution
 CAMERA_WIDTH = 640
