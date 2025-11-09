@@ -1,0 +1,15 @@
+# Requirements for ArUco Detection System
+# Install on Raspberry Pi with: pip3 install -r requirements.txt
+
+# Computer Vision
+opencv-python>=4.5.0
+opencv-contrib-python>=4.5.0
+
+# Numerical computing
+numpy>=1.19.0
+
+# Serial communication (for motor control)
+pyserial>=3.5
+
+# Note: On Raspberry Pi, you can also install these via apt:
+# sudo apt-get install python3-opencv python3-numpy python3-serial
