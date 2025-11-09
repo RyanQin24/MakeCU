@@ -386,7 +386,7 @@ python3 -c "import cv2; cap = cv2.VideoCapture(0); print(cap.isOpened())"
 ```bash
 # Check device exists
 ls -l /dev/ttyACM*
-# May be /dev/ttyACM1 or /dev/ttyUSB0 - adjust --serial parameter
+# May be /dev/ttyACM2 or /dev/ttyUSB0 - adjust --serial parameter
 
 # Check permissions
 groups  # Should include 'dialout'
