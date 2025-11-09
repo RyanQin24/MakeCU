@@ -50,16 +50,18 @@ LEFT_L_POWER = 260
 LEFT_R_POWER = 260
 BACKUP_POWER = -200  # Power for backing up
 
-# Serial configuration - PORT 1 FOR MOTORS, PORT 0 FOR SENSORS
+# Serial configuration - PORT 1 FOR MOTORS, PORT 0 FOR SENSORS, PORT 1 FOR SERVOS
 MOTOR_SERIAL_PORT = '/dev/ttyACM2'
 SENSOR_SERIAL_PORT = '/dev/ttyACM0'
+SERVO_SERIAL_PORT = '/dev/ttyACM1'
 MOTOR_BAUD_RATE = 57600
 SENSOR_BAUD_RATE = 9600
+SERVO_BAUD_RATE = 9600
 SERIAL_TIMEOUT = 1
 
 # Detection and control parameters
 CENTER_TOLERANCE = 50  # pixels - if bin is within ±50px of center, consider it centered
-TURN_SPEED_DIVISOR = 2  # reduce turn speed for smoother centering
+TURN_SPEED_DIVISOR = 4  # reduce turn speed for smoother centering (higher = gentler turns)
 MIN_BIN_DISTANCE = 0.15  # minimum distance estimate (0-1) to consider bin close enough
 
 # Obstacle avoidance thresholds (cm)
@@ -68,6 +70,17 @@ SLOW_DISTANCE = 30.0      # Slow down
 SIDE_WARNING = 15.0       # Bias away from side obstacles
 BACKUP_DURATION = 1.0     # Seconds to backup when all blocked
 TURN_DURATION = 0.5       # Seconds to turn after backup
+
+# Blue bin arrival detection (using camera, not ultrasonic)
+BLUE_FULL_FRAME_THRESHOLD = 0.90  # 90% of frame blue = reached bin
+CENTER_ANGLE_TOLERANCE = 10.0     # degrees - bin must be centered
+STOP_MIN_CONFIDENCE = 0.3         # minimum confidence for stopping
+
+# Servo arm control
+SERVO_EXTEND_COMMAND = 'e'
+SERVO_RETRACT_COMMAND = 'r'
+SERVO_CYCLE_COUNT = 3             # Number of extend/retract cycles
+SERVO_ACTION_DELAY = 2.0          # Seconds to wait for servo to complete action
 
 
 def send_motor_command(ser, left_power, right_power):
@@ -109,90 +122,221 @@ def backup_and_turn(ser):
     logging.info("Backup and turn complete")
 
 
-def compute_motor_command_with_obstacles(angle, distance_estimate, frame_width, obstacles):
+def hardcoded_obstacle_avoidance(ser):
     """
-    Compute motor commands based on bin angle, distance, and obstacle detection.
+    Hardcoded obstacle avoidance path for demo:
+    1. Turn left for TURN_DURATION
+    2. Pause 0.5s
+    3. Move straight for 2s
+    4. Pause 0.5s
+    5. Turn right for TURN_DURATION (same duration as left turn)
     
     Args:
-        angle: horizontal angle to bin (-90 to +90 degrees, negative=left, positive=right)
-        distance_estimate: bin size estimate (0-1, higher = closer)
-        frame_width: width of the camera frame (for reference)
-        obstacles: dict with 'front', 'left', 'right' distances in cm
+        ser: Motor serial connection
+    """
+    logging.info("🔄 Starting hardcoded obstacle avoidance maneuver")
     
+    # Use FULL turn power for obstacle avoidance (not divided for centering)
+    turn_left = LEFT_L_POWER
+    turn_right = LEFT_R_POWER
+    
+    # Step 1: Turn left with FULL power
+    logging.info("  Step 1: Turning left...")
+    send_motor_command(ser, -turn_left, -turn_right)
+    time.sleep(TURN_DURATION)
+    stop_motors(ser)
+    
+    # Step 2: Pause 0.5s
+    logging.info("  Step 2: Pause...")
+    time.sleep(0.5)
+    
+    # Step 3: Move straight for 2s with FULL power
+    logging.info("  Step 3: Moving forward...")
+    send_motor_command(ser, FORWARD_LEFT_POWER, FORWARD_RIGHT_POWER)
+    time.sleep(2.0)
+    stop_motors(ser)
+    
+    # Step 4: Pause 0.5s
+    logging.info("  Step 4: Pause...")
+    time.sleep(0.5)
+    
+    # Step 5: Turn right with FULL power (same duration as left turn)
+    logging.info("  Step 5: Turning right...")
+    send_motor_command(ser, turn_left, turn_right)
+    time.sleep(TURN_DURATION)
+    stop_motors(ser)
+    
+    logging.info("✓ Hardcoded obstacle avoidance complete")
+    return True
+
+
+def perform_servo_cycles(motor_ser, servo_ser):
+    """
+    Perform extend/retract cycles with servo arms after reaching blue bin.
+    Robot must stay completely stopped during this operation.
+    
+    Args:
+        motor_ser: Motor serial connection (to keep robot stopped)
+        servo_ser: Servo serial connection (to control arms)
+    """
+    logging.info("🤖 Starting servo arm cycles")
+    
+    # Ensure motors are stopped
+    stop_motors(motor_ser)
+    
+    for cycle in range(1, SERVO_CYCLE_COUNT + 1):
+        logging.info(f"  Cycle {cycle}/{SERVO_CYCLE_COUNT}")
+        
+        # Extend arms
+        logging.info(f"    → Extending arms...")
+        try:
+            servo_ser.write(SERVO_EXTEND_COMMAND.encode())
+            servo_ser.flush()
+        except serial.SerialException as e:
+            logging.error(f"Failed to send extend command: {e}")
+        
+        time.sleep(SERVO_ACTION_DELAY)
+        
+        # Keep motors stopped during servo operation
+        stop_motors(motor_ser)
+        
+        # Retract arms
+        logging.info(f"    ← Retracting arms...")
+        try:
+            servo_ser.write(SERVO_RETRACT_COMMAND.encode())
+            servo_ser.flush()
+        except serial.SerialException as e:
+            logging.error(f"Failed to send retract command: {e}")
+        
+        time.sleep(SERVO_ACTION_DELAY)
+        
+        # Keep motors stopped during servo operation
+        stop_motors(motor_ser)
+    
+    logging.info("✓ Servo cycles complete")
+    logging.info("🎉 FINISHED - Mission complete!")
+
+
+def search_360_for_bin(ser, detector):
+    """
+    Rotate 360 degrees looking for the blue bin.
+    Stop when bin is found or after full rotation.
+    
+    Args:
+        ser: Motor serial connection
+        detector: BlueBinDetector instance
+        
     Returns:
-        tuple: (left_power, right_power, action_description, should_backup)
+        True if bin found, False if not
+    """
+    logging.info("🔍 Starting 360° search for blue bin")
+    
+    # Rotation parameters
+    turn_left = LEFT_L_POWER // TURN_SPEED_DIVISOR
+    turn_right = LEFT_R_POWER // TURN_SPEED_DIVISOR
+    
+    # Rotate in small steps (36 steps = 10° each)
+    steps = 36
+    step_duration = 0.3  # seconds per step
+    
+    for step in range(steps):
+        # Turn right slowly
+        send_motor_command(ser, turn_left // 2, turn_right // 2)
+        time.sleep(step_duration)
+        
+        # Stop and check for bin
+        stop_motors(ser)
+        time.sleep(0.1)
+        
+        detection = detector.detect_blue_bin()
+        if detection is not None:
+            angle, distance_estimate, confidence = detection
+            logging.info(f"✓ Bin found at step {step+1}/{steps}! Angle:{angle:+.1f}° Dist:{distance_estimate:.2f}")
+            return True
+        
+        # Brief pause before next step
+        time.sleep(0.1)
+    
+    # Completed full rotation without finding bin
+    logging.info("✗ 360° search complete - no bin found")
+    stop_motors(ser)
+    return False
+
+
+def compute_motor_command_with_obstacles(angle, distance_estimate, confidence, blue_ratio, frame_width, obstacles):
+    """
+    Compute motor commands based on bin angle, distance, blue coverage, and obstacle detection.
+    Returns: (left_power, right_power, action_description, trigger_value)
+    
+    trigger_value:
+        - False: Normal movement
+        - True: All blocked - need backup_and_turn
+        - 'left'/'right': Front blocked - use hardcoded_obstacle_avoidance
     """
     front = obstacles['front']
     left = obstacles['left']
     right = obstacles['right']
-    
-    # Check if all sensors are blocked
-    if front < DANGER_DISTANCE and left < SIDE_WARNING and right < SIDE_WARNING:
+
+    # ✅ 1) ARRIVAL: Stop when frame is mostly blue (90%) and bin is centered
+    # Uses CAMERA to detect arrival, not ultrasonic sensor
+    if (blue_ratio >= BLUE_FULL_FRAME_THRESHOLD and
+        abs(angle) <= CENTER_ANGLE_TOLERANCE and
+        confidence >= STOP_MIN_CONFIDENCE):
+        return (0, 0, f"🎯 REACHED BLUE BIN (blue={blue_ratio*100:.0f}%) - STOP", False)
+
+    # ✅ 2) All sensors blocked -> only treat as "blocked" if we're NOT aligned with the bin
+    if (front < DANGER_DISTANCE and
+        left < SIDE_WARNING and
+        right < SIDE_WARNING and
+        abs(angle) > CENTER_ANGLE_TOLERANCE):
         return (0, 0, "All blocked - need backup", True)
-    
-    # Check if front is blocked
-    if front < DANGER_DISTANCE:
-        # Need to navigate around - turn towards clearer side
-        if left < right:
-            # Right side is clearer - turn right
-            turn_left = LEFT_L_POWER // TURN_SPEED_DIVISOR
-            turn_right = LEFT_R_POWER // TURN_SPEED_DIVISOR
-            return (turn_left, turn_right, f"Front blocked ({front:.0f}cm) - turn right", False)
-        else:
-            # Left side is clearer - turn left
-            turn_left = LEFT_L_POWER // TURN_SPEED_DIVISOR
-            turn_right = LEFT_R_POWER // TURN_SPEED_DIVISOR
-            return (-turn_left, -turn_right, f"Front blocked ({front:.0f}cm) - turn left", False)
-    
+
+    # ✅ 3) Front blocked -> trigger hardcoded avoidance if obstacle is NOT the bin we're aligned with
+    if front < DANGER_DISTANCE and abs(angle) > CENTER_ANGLE_TOLERANCE:
+        # Need to navigate around - determine clearer side
+        clearer_side = 'right' if right > left else 'left'
+        return (0, 0, f"Front blocked ({front:.0f}cm) - avoid {clearer_side}", clearer_side)
+
+    # (unchanged below - normal tracking)
+
     # Convert angle to approximate pixel offset for bin tracking
     frame_center = frame_width / 2.0
     pixel_offset_estimate = (angle / 30.0) * frame_center
-    
+
     # Determine speed based on front distance
     if front < SLOW_DISTANCE:
-        # Slow zone
         forward_left = FORWARD_LEFT_POWER // 2
         forward_right = FORWARD_RIGHT_POWER // 2
         speed_label = "slow"
     else:
-        # Normal speed
         forward_left = FORWARD_LEFT_POWER
         forward_right = FORWARD_RIGHT_POWER
         speed_label = "normal"
-    
+
     # Adjust for side obstacles
     side_bias = ""
     if left < SIDE_WARNING:
-        # Obstacle on left - bias right
         side_bias = " (avoiding left)"
-        # Reduce left motor power to steer right
         forward_left = int(forward_left * 0.7)
     elif right < SIDE_WARNING:
-        # Obstacle on right - bias left
         side_bias = " (avoiding right)"
-        # Reduce right motor power to steer left
         forward_right = int(forward_right * 0.7)
-    
-    # Check if bin is centered horizontally
+
+    # Bin centered → go forward (distance estimation unreliable, rely on front sensor instead)
     if abs(pixel_offset_estimate) <= CENTER_TOLERANCE:
-        # Bin is centered - move forward if bin is close enough
-        if distance_estimate >= MIN_BIN_DISTANCE:
-            return (forward_left, forward_right, f"Forward ({speed_label}){side_bias}", False)
-        else:
-            # Bin too small/far - just stop
-            return (0, 0, "Stop (bin too far)", False)
-    
-    # Bin is off-center - turn to center it
-    elif angle < 0:
-        # Bin is to the left of center - turn left
+        return (forward_left, forward_right, f"Forward ({speed_label}){side_bias}", False)
+
+    # Bin left/right → turn to re-center
+    if angle < 0:
         turn_left = LEFT_L_POWER // TURN_SPEED_DIVISOR
         turn_right = LEFT_R_POWER // TURN_SPEED_DIVISOR
         return (-turn_left, -turn_right, f"Turn left{side_bias}", False)
     else:
-        # Bin is to the right of center - turn right
         turn_left = LEFT_L_POWER // TURN_SPEED_DIVISOR
         turn_right = LEFT_R_POWER // TURN_SPEED_DIVISOR
         return (turn_left, turn_right, f"Turn right{side_bias}", False)
+
+
 
 
 def main():
@@ -206,10 +350,14 @@ def main():
                         help=f'Motor serial port (default: {MOTOR_SERIAL_PORT})')
     parser.add_argument('--sensor-serial', type=str, default=SENSOR_SERIAL_PORT,
                         help=f'Sensor serial port (default: {SENSOR_SERIAL_PORT})')
+    parser.add_argument('--servo-serial', type=str, default=SERVO_SERIAL_PORT,
+                        help=f'Servo serial port (default: {SERVO_SERIAL_PORT})')
     parser.add_argument('--motor-baud', type=int, default=MOTOR_BAUD_RATE,
                         help=f'Motor baud rate (default: {MOTOR_BAUD_RATE})')
     parser.add_argument('--sensor-baud', type=int, default=SENSOR_BAUD_RATE,
                         help=f'Sensor baud rate (default: {SENSOR_BAUD_RATE})')
+    parser.add_argument('--servo-baud', type=int, default=SERVO_BAUD_RATE,
+                        help=f'Servo baud rate (default: {SERVO_BAUD_RATE})')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging and camera visualization')
     args = parser.parse_args()
@@ -241,7 +389,23 @@ def main():
         logging.error(f"Failed to open motor serial port {args.motor_serial}: {e}")
         sys.exit(1)
 
-    # 2) Initialize ultrasonic sensors
+    # 2) Initialize servo controller
+    try:
+        servo_ser = serial.Serial(
+            args.servo_serial,
+            baudrate=args.servo_baud,
+            timeout=SERIAL_TIMEOUT,
+            write_timeout=1.0
+        )
+        time.sleep(2)  # Wait for device initialization
+        logging.info(f"Servo serial connection established: {args.servo_serial} @ {args.servo_baud} baud")
+    except serial.SerialException as e:
+        logging.error(f"Failed to open servo serial port {args.servo_serial}: {e}")
+        stop_motors(motor_ser)
+        motor_ser.close()
+        sys.exit(1)
+
+    # 3) Initialize ultrasonic sensors
     try:
         sensors = TripleUltrasonicSensor(
             port=args.sensor_serial,
@@ -253,9 +417,10 @@ def main():
         logging.error(f"Failed to initialize ultrasonic sensors: {e}")
         stop_motors(motor_ser)
         motor_ser.close()
+        servo_ser.close()
         sys.exit(1)
 
-    # 3) Initialize Blue Bin Detector
+    # 4) Initialize Blue Bin Detector
     try:
         # Only show debug windows if not headless AND debug is enabled
         show_debug = args.debug and not args.headless
@@ -276,13 +441,21 @@ def main():
         logging.error(f"Failed to initialize Blue Bin Detector: {e}")
         stop_motors(motor_ser)
         motor_ser.close()
+        servo_ser.close()
         sensors.close()
         sys.exit(1)
+
 
     last_action = "Stop (no bin)"
     frame_count = 0
     detection_count = 0
     no_detection_count = 0
+    consecutive_no_detection = 0  # Track consecutive frames without detection
+    in_obstacle_avoidance = False  # Flag to pause bin tracking during arc-around
+    mission_complete = False  # Flag to end program after servo cycles
+    no_detection_count = 0
+    consecutive_no_detection = 0  # Track consecutive frames without detection
+    in_obstacle_avoidance = False  # Flag to pause bin tracking during arc-around
     
     try:
         while True:
@@ -291,61 +464,143 @@ def main():
             # Read obstacle sensors
             obstacles = sensors.read_sensors()
             
-            # Detect blue bin
-            detection = detector.detect_blue_bin()
+            # Detect blue bin (only if not in obstacle avoidance mode)
+            if not in_obstacle_avoidance:
+                detection = detector.detect_blue_bin()
+            else:
+                detection = None  # Ignore camera during obstacle maneuver
             
             # Debug logging for detection
             if args.debug:
                 if detection is not None:
-                    angle, dist_est, conf = detection
-                    logging.debug(f"[DETECTION] Angle:{angle:+.1f}° Dist:{dist_est:.2f} Conf:{conf:.2f}")
+                    angle, dist_est, conf, blue_r = detection
+                    logging.debug(f"[DETECTION] Angle:{angle:+.1f}° Dist:{dist_est:.2f} Conf:{conf:.2f} Blue:{blue_r*100:.1f}%")
                 else:
                     logging.debug(f"[NO DETECTION] Frame {frame_count}")
 
             # Process detection results
             if detection is not None:
                 detection_count += 1
-                angle, distance_estimate, confidence = detection
+                consecutive_no_detection = 0  # Reset counter
+                angle, distance_estimate, confidence, blue_ratio = detection
                 
                 # Log first detection
-                if last_action == "Stop (no bin)":
-                    logging.info(f"✓ Blue bin detected! Angle:{angle:+.1f}° Dist:{distance_estimate:.2f} Conf:{confidence:.2f}")
+                if last_action == "Stop (no bin)" or last_action.startswith("Searching"):
+                    logging.info(f"✓ Blue bin detected! Angle:{angle:+.1f}° Dist:{distance_estimate:.2f} Conf:{confidence:.2f} Blue:{blue_ratio*100:.1f}%")
                 
                 # Compute motor command based on bin position and obstacles
-                left_power, right_power, action, should_backup = compute_motor_command_with_obstacles(
-                    angle, distance_estimate, frame_width, obstacles
+                result = compute_motor_command_with_obstacles(
+                    angle, distance_estimate, confidence, blue_ratio, frame_width, obstacles
                 )
                 
-                # Check if we need to backup and turn
-                if should_backup:
-                    backup_and_turn(motor_ser)
-                    last_action = "Backed up and turned"
-                else:
-                    send_motor_command(motor_ser, left_power, right_power)
+                # Unpack result - can be 4 values or special case with clearer_side
+                if len(result) == 4:
+                    left_power, right_power, action, trigger_value = result
                     
-                    # Log info periodically or when action changes
-                    if action != last_action or frame_count % 30 == 0:
-                        logging.info(
-                            f"Bin: {angle:+.1f}° | Dist: {distance_estimate:.2f} | "
-                            f"Obstacles: F={obstacles['front']:.0f} L={obstacles['left']:.0f} R={obstacles['right']:.0f}cm | "
-                            f"Action: {action}"
-                        )
-                        last_action = action
+                    # Check if trigger_value is True (backup) or a string (hardcoded path)
+                    if trigger_value is True:
+                        # Old backup behavior for all-blocked scenario
+                        backup_and_turn(motor_ser)
+                        last_action = "Backed up and turned"
+                    elif isinstance(trigger_value, str):
+                        # Front blocked - use hardcoded obstacle avoidance path
+                        # Retry up to 3 times before giving up
+                        in_obstacle_avoidance = True
+                        logging.info(f"🚧 Obstacle detected - pausing bin tracking for hardcoded avoidance")
+                        
+                        retry_count = 0
+                        max_retries = 3
+                        path_clear = False
+                        
+                        while retry_count < max_retries:
+                            hardcoded_obstacle_avoidance(motor_ser)
+                            retry_count += 1
+                            
+                            # Check if front is still blocked after maneuver
+                            time.sleep(0.2)  # Brief delay to get fresh sensor reading
+                            obstacles_check = sensors.read_sensors()
+                            front_dist = obstacles_check.get('front', 0.0) if obstacles_check else 0.0
+                            front_dist = front_dist if front_dist is not None else 0.0
+                            
+                            if front_dist > DANGER_DISTANCE:
+                                logging.info(f"✓ Path clear after {retry_count} attempt(s)")
+                                path_clear = True
+                                break
+                            else:
+                                logging.info(f"⚠ Front still blocked ({front_dist:.0f}cm) - retry {retry_count}/{max_retries}")
+                        
+                        # If still blocked after retries, fall back to backup_and_turn
+                        if not path_clear:
+                            logging.info(f"❌ Path still blocked after {max_retries} attempts - using backup and turn")
+                            backup_and_turn(motor_ser)
+                        
+                        in_obstacle_avoidance = False
+                        logging.info(f"✓ Obstacle avoidance complete - resuming bin tracking")
+                        last_action = f"Hardcoded obstacle avoidance"
+                    else:
+                        # Normal movement
+                        send_motor_command(motor_ser, left_power, right_power)
+                        
+                        # Check if we reached the blue bin (action contains "REACHED BLUE BIN")
+                        if "REACHED BLUE BIN" in action:
+                            logging.info("=" * 60)
+                            logging.info("🎯 BLUE BIN REACHED!")
+                            logging.info("=" * 60)
+                            
+                            # Ensure motors are stopped
+                            stop_motors(motor_ser)
+                            
+                            # Perform servo cycles
+                            perform_servo_cycles(motor_ser, servo_ser)
+                            
+                            # Set flag to end program
+                            mission_complete = True
+                            break  # Exit main loop
+                        
+                        # Log info periodically or when action changes
+                        if action != last_action or frame_count % 30 == 0:
+                            logging.info(
+                                f"Bin: {angle:+.1f}° | Blue: {blue_ratio*100:.0f}% | "
+                                f"Obstacles: F={obstacles['front']:.0f} L={obstacles['left']:.0f} R={obstacles['right']:.0f}cm | "
+                                f"Action: {action}"
+                            )
+                            last_action = action
 
             else:
                 no_detection_count += 1
-                # No bin detected - stop motors
-                stop_motors(motor_ser)
-                if last_action != "Stop (no bin)":
-                    logging.info(f"✗ Blue bin lost after {detection_count} detections")
-                    last_action = "Stop (no bin)"
+                consecutive_no_detection += 1
                 
-                # Periodic logging when no bin detected
-                if frame_count % 50 == 0:
-                    logging.info(f"No bin detected for {no_detection_count} frames (total frames: {frame_count})")
+                # Check if we should trigger 360° search (after 10 consecutive frames without detection)
+                if consecutive_no_detection >= 10 and not in_obstacle_avoidance:
+                    logging.info(f"⚠ Blue bin lost for {consecutive_no_detection} frames - initiating 360° search")
+                    last_action = "Searching 360°"
+                    
+                    # Perform 360° search
+                    bin_found = search_360_for_bin(motor_ser, detector)
+                    
+                    if bin_found:
+                        consecutive_no_detection = 0  # Reset counter
+                        logging.info("✓ 360° search successful - resuming tracking")
+                        last_action = "Resumed after search"
+                    else:
+                        logging.info("✗ 360° search failed - stopping and waiting")
+                        stop_motors(motor_ser)
+                        last_action = "Stop (no bin after search)"
+                        consecutive_no_detection = 0  # Reset to avoid repeated searches
+                else:
+                    # No bin detected - stop motors
+                    stop_motors(motor_ser)
+                    if last_action != "Stop (no bin)" and consecutive_no_detection == 1:
+                        logging.info(f"✗ Blue bin lost after {detection_count} detections")
+                        last_action = "Stop (no bin)"
+                    
+                    # Periodic logging when no bin detected
+                    if frame_count % 50 == 0:
+                        logging.info(f"No bin detected for {no_detection_count} frames (total frames: {frame_count})")
 
             # Small delay to prevent overwhelming the system
             time.sleep(0.05)
+
 
     except KeyboardInterrupt:
         logging.info("KeyboardInterrupt received — exiting.")
@@ -353,6 +608,7 @@ def main():
         # Cleanup
         stop_motors(motor_ser)
         motor_ser.close()
+        servo_ser.close()
         sensors.close()
         detector.cleanup()
         
@@ -368,6 +624,11 @@ def main():
         logging.info(f"Sensor readings: {sensor_stats['total_readings']}")
         logging.info(f"Valid sensor readings: {sensor_stats['valid_readings']} ({sensor_stats['success_rate']:.1f}%)")
         logging.info("="*60)
+        
+        if mission_complete:
+            logging.info("✓ Mission completed successfully!")
+        
+        logging.info("Motors stopped, serial closed, sensors/camera released. Goodbye.")
         logging.info("Motors stopped, serial closed, sensors/camera released. Goodbye.")
 
 

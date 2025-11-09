@@ -62,17 +62,19 @@ class BlueBinDetector:
         self.total_frames = 0
         self.detected_frames = 0
     
-    def detect_blue_bin(self) -> Optional[Tuple[float, float, float]]:
+    def detect_blue_bin(self) -> Optional[Tuple[float, float, float, float]]:
         """
         Detect blue bin in current camera frame.
         
         Returns:
-            Tuple of (angle, distance_estimate, confidence) or None
+            Tuple of (angle, distance_estimate, confidence, blue_ratio) or None
             - angle: Horizontal angle to bin center (-90 to +90 degrees)
               Negative = left, Positive = right
             - distance_estimate: Rough distance based on bin size (0-1)
               Larger bin = closer (higher value)
             - confidence: Detection confidence (0-1)
+            - blue_ratio: Percentage of frame covered by blue bin (0-1)
+              Used to detect when bin is reached (>0.9 = touching bin)
         """
         # Read frame
         ret, frame = self.cap.read()
@@ -142,6 +144,10 @@ class BlueBinDetector:
         max_area = self.config.CAMERA_WIDTH * self.config.CAMERA_HEIGHT * 0.5
         distance_estimate = min(1.0, area / max_area)
         
+        # Calculate blue_ratio: what percentage of frame is covered by blue bin
+        frame_area = self.config.CAMERA_WIDTH * self.config.CAMERA_HEIGHT
+        blue_ratio = area / frame_area
+        
         # Calculate confidence based on shape
         # Perfect rectangle = high confidence
         rect_area = w * h
@@ -157,11 +163,12 @@ class BlueBinDetector:
                 'bbox': (x, y, w, h),
                 'center': (bin_center_x, bin_center_y),
                 'angle': angle,
-                'area': area
+                'area': area,
+                'blue_ratio': blue_ratio
             }
             self._show_debug(frame, mask, debug_info)
         
-        return (angle, distance_estimate, confidence)
+        return (angle, distance_estimate, confidence, blue_ratio)
     
     def _show_debug(self, frame, mask, detection_info):
         """Show debug visualization windows."""
@@ -185,10 +192,13 @@ class BlueBinDetector:
             # Add text
             angle = detection_info['angle']
             area = detection_info['area']
+            blue_ratio = detection_info.get('blue_ratio', 0.0)
             cv2.putText(debug_frame, f"Angle: {angle:+.1f} deg", 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(debug_frame, f"Area: {area:.0f} px", 
                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(debug_frame, f"Blue: {blue_ratio*100:.1f}%", 
+                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         # Show frames
         cv2.imshow("Camera View", debug_frame)
